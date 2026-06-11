@@ -271,16 +271,18 @@ object Repo {
 
     // picker URI grants can go stale (and cloud-backed photos can fail on re-open),
     // so grab the bytes the moment the user picks
-    fun cachePickedImage(ctx: Context, uri: Uri): Result<File> = try {
-        val f = File(ctx.cacheDir, "picked_art")
-        ctx.contentResolver.openInputStream(uri)?.use { ins ->
-            f.outputStream().use { ins.copyTo(it) }
-        } ?: return Result.failure(Exception("Couldn't open the picked image"))
-        if (decodeScaled(64) { f.inputStream() } == null)
-            Result.failure(Exception("That file isn't a readable image — try a different one"))
-        else Result.success(f)
-    } catch (e: Exception) {
-        Result.failure(Exception("Couldn't read the picked image (${e.message})"))
+    fun cachePickedImage(ctx: Context, uri: Uri): Result<File> {
+        return try {
+            val f = File(ctx.cacheDir, "picked_art")
+            ctx.contentResolver.openInputStream(uri)?.use { ins ->
+                f.outputStream().use { ins.copyTo(it) }
+            } ?: return Result.failure(Exception("Couldn't open the picked image"))
+            if (decodeScaled(64) { f.inputStream() } == null)
+                Result.failure(Exception("That file isn't a readable image — try a different one"))
+            else Result.success(f)
+        } catch (e: Exception) {
+            Result.failure(Exception("Couldn't read the picked image (${e.message})"))
+        }
     }
 
     fun decodeArtFile(f: File): Bitmap? = decodeScaled(1024) { f.inputStream() }
