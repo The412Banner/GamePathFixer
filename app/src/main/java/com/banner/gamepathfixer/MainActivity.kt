@@ -29,6 +29,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -95,6 +96,20 @@ object Repo {
             }
         }
         return out.sortedBy { it.label.lowercase() }
+    }
+
+    fun releaseTree(ctx: Context, v: Variant) {
+        ctx.contentResolver.persistedUriPermissions
+            .filter { it.uri.authority == v.authority }
+            .forEach {
+                try {
+                    ctx.contentResolver.releasePersistableUriPermission(
+                        it.uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                } catch (_: Exception) {
+                }
+            }
     }
 
     fun persistedTree(ctx: Context, v: Variant): Uri? =
@@ -435,6 +450,14 @@ fun AppRoot() {
         }
 
         sel != null && treeUri != null -> {
+            val reselectFolder = {
+                Repo.releaseTree(ctx, sel)
+                treeUri = null
+                games = emptyList()
+                status = null
+                toast("Pick again: tap ☰, choose \"${sel.label}\", then USE THIS FOLDER")
+                treeLauncher.launch(null)
+            }
             BackHandler { selected = null; treeUri = null; games = emptyList(); status = null }
             Scaffold(topBar = {
                 TopAppBar(
@@ -445,6 +468,9 @@ fun AppRoot() {
                         }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "back") }
                     },
                     actions = {
+                        IconButton(onClick = reselectFolder) {
+                            Icon(Icons.Default.FolderOpen, "re-select data folder")
+                        }
                         IconButton(onClick = { reload() }) { Icon(Icons.Default.Refresh, "refresh") }
                     }
                 )
@@ -466,6 +492,10 @@ fun AppRoot() {
                     ) { CircularProgressIndicator() }
                     status?.let {
                         Text(it, color = Color(0xFFEF5350), modifier = Modifier.padding(16.dp))
+                        TextButton(
+                            onClick = reselectFolder,
+                            modifier = Modifier.padding(horizontal = 8.dp)
+                        ) { Text("Re-select data folder") }
                     }
                     if (!busy && games.isEmpty() && status == null)
                         Text("No games in this app's library.", Modifier.padding(16.dp))
