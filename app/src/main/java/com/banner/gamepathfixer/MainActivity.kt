@@ -269,8 +269,21 @@ object Repo {
         }
     }
 
-    fun loadPickedImage(ctx: Context, uri: Uri): Bitmap? =
-        decodeScaled(1024) { ctx.contentResolver.openInputStream(uri) }
+    // picker URI grants can go stale (and cloud-backed photos can fail on re-open),
+    // so grab the bytes the moment the user picks
+    fun cachePickedImage(ctx: Context, uri: Uri): Result<File> = try {
+        val f = File(ctx.cacheDir, "picked_art")
+        ctx.contentResolver.openInputStream(uri)?.use { ins ->
+            f.outputStream().use { ins.copyTo(it) }
+        } ?: return Result.failure(Exception("Couldn't open the picked image"))
+        if (decodeScaled(64) { f.inputStream() } == null)
+            Result.failure(Exception("That file isn't a readable image — try a different one"))
+        else Result.success(f)
+    } catch (e: Exception) {
+        Result.failure(Exception("Couldn't read the picked image (${e.message})"))
+    }
+
+    fun decodeArtFile(f: File): Bitmap? = decodeScaled(1024) { f.inputStream() }
 
     // the target app reads art straight off disk, so the new PNG must live somewhere
     // both apps can reach by absolute path — a public Pictures subfolder
@@ -318,11 +331,11 @@ object Repo {
         game: GameRow,
         newPathRaw: String?,
         newNameRaw: String?,
-        artUri: Uri?
+        artFile: File?
     ): Result<String> {
         val newPath = newPathRaw?.trim()?.takeIf { it.isNotEmpty() && it != game.path }
         val newName = newNameRaw?.trim()?.takeIf { it.isNotEmpty() && it != game.name }
-        if (newPath == null && newName == null && artUri == null)
+        if (newPath == null && newName == null && artFile == null)
             return Result.failure(Exception("Nothing changed"))
 
         if (newPath != null) {
@@ -333,9 +346,9 @@ object Repo {
         }
 
         var artPath: String? = null
-        if (artUri != null) {
-            val bmp = loadPickedImage(ctx, artUri)
-                ?: return Result.failure(Exception("Couldn't read the picked image"))
+        if (artFile != null) {
+            val bmp = decodeArtFile(artFile)
+                ?: return Result.failure(Exception("Couldn't decode the picked image"))
             artPath = writeArtPng(ctx, bmp, newName ?: game.name)
                 .getOrElse { return Result.failure(it) }
         }
@@ -441,7 +454,7 @@ fun AppRoot() {
     var editing by remember { mutableStateOf<GameRow?>(null) }
     var newPath by remember { mutableStateOf("") }
     var newName by remember { mutableStateOf("") }
-    var artUri by remember { mutableStateOf<Uri?>(null) }
+    var artFile by remember { mutableStateOf<File?>(null) }
     var artPreview by remember { mutableStateOf<Bitmap?>(null) }
     var currentArt by remember { mutableStateOf<Bitmap?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -505,11 +518,17 @@ fun AppRoot() {
     val artLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri ->
-        if (uri != null) artUri = uri
-    }
-
-    LaunchedEffect(artUri) {
-        artPreview = artUri?.let { withContext(Dispatchers.IO) { Repo.loadPickedImage(ctx, it) } }
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val res = withContext(Dispatchers.IO) { Repo.cachePickedImage(ctx, uri) }
+            res.fold(
+                onSuccess = { f ->
+                    artPreview = withContext(Dispatchers.IO) { Repo.decodeArtFile(f) }
+                    artFile = f
+                },
+                onFailure = { toast(it.message ?: "Couldn't read that image") }
+            )
+        }
     }
 
     LaunchedEffect(editing, treeUri) {
@@ -598,9 +617,9 @@ fun AppRoot() {
                         }
                         Column {
                             OutlinedButton(onClick = { artLauncher.launch("image/*") }) {
-                                Text(if (artUri == null) "Choose image…" else "Change…")
+                                Text(if (artFile == null) "Choose image…" else "Change…")
                             }
-                            if (artUri != null) TextButton(onClick = { artUri = null }) {
+                            if (artFile != null) TextButton(onClick = { artFile = null; artPreview = null }) {
                                 Text("Keep current art")
                             }
                         }
@@ -608,7 +627,7 @@ fun AppRoot() {
 
                     val dirty = (newPath.isNotBlank() && newPath != editingGame.path) ||
                         (newName.isNotBlank() && newName.trim() != editingGame.name) ||
-                        artUri != null
+                        artFile != null
                     Button(
                         enabled = !busy && dirty,
                         onClick = {
@@ -619,7 +638,7 @@ fun AppRoot() {
                                 val res = withContext(Dispatchers.IO) {
                                     Repo.saveChanges(
                                         ctx, treeUri!!, editingGame,
-                                        newPath, newName, artUri
+                                        newPath, newName, artFile
                                     )
                                 }
                                 busy = false
@@ -627,10 +646,13 @@ fun AppRoot() {
                                     onSuccess = {
                                         toast(it)
                                         editing = null
-                                        artUri = null
+                                        artFile = null; artPreview = null
                                         reload()
                                     },
-                                    onFailure = { status = it.message }
+                                    onFailure = {
+                                        status = it.message
+                                        toast(it.message ?: "Save failed")
+                                    }
                                 )
                             }
                         }
@@ -719,7 +741,7 @@ fun AppRoot() {
                         items(games, key = { it.id }) { g ->
                             Card(onClick = {
                                 editing = g; newPath = g.path; newName = g.name
-                                artUri = null; status = null
+                                artFile = null; artPreview = null; status = null
                             }) {
                                 Column(Modifier.fillMaxWidth().padding(12.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
