@@ -1,14 +1,18 @@
 package com.banner.gamepathfixer
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteDatabase
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -16,6 +20,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,9 +29,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.FolderOpen
@@ -54,7 +63,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -64,6 +76,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.InputStream
 
 data class Variant(val pkg: String, val label: String, val authority: String, val version: String)
 
@@ -72,6 +85,7 @@ data class GameRow(
     val name: String,
     val path: String,
     val jsonPath: String,
+    val iconPath: String,
     val exists: Boolean?
 )
 
@@ -140,7 +154,9 @@ object Repo {
     private fun dbDir(ctx: Context, tree: Uri): DocumentFile? {
         val root = DocumentFile.fromTreeUri(ctx, tree) ?: return null
         if (root.name == "databases") return root
-        return root.findFile("databases")
+        root.findFile("databases")?.let { return it }
+        // grant at the provider's top root: databases lives under data/
+        return root.findFile("data")?.findFile("databases")
     }
 
     private fun workDir(ctx: Context): File = File(ctx.cacheDir, "dbwork")
@@ -186,16 +202,18 @@ object Repo {
                     val data = c.getString(2) ?: ""
                     var name = ""
                     var jsonPath = ""
+                    var iconPath = ""
                     try {
                         val j = JSONObject(data)
                         name = j.optString("name")
                         jsonPath = j.optString("filePath")
+                        iconPath = j.optString("localGameIconPath")
                     } catch (_: Exception) {
                     }
                     if (name.isBlank()) name = path.substringAfterLast('/')
                     val exists =
                         if (canCheck && path.startsWith("/")) File(path).exists() else null
-                    rows.add(GameRow(id, name, path, jsonPath, exists))
+                    rows.add(GameRow(id, name, path, jsonPath, iconPath, exists))
                 }
             }
             db.close()
@@ -205,12 +223,122 @@ object Repo {
         }
     }
 
-    fun saveFix(ctx: Context, tree: Uri, game: GameRow, newPathRaw: String): Result<String> {
-        val newPath = newPathRaw.trim()
-        if (!newPath.startsWith("/"))
-            return Result.failure(Exception("New path must be absolute (start with /)"))
-        if (canCheckFiles() && !File(newPath).exists())
-            return Result.failure(Exception("That file doesn't exist:\n$newPath"))
+    private fun decodeScaled(maxDim: Int, open: () -> InputStream?): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        try {
+            open()?.use { BitmapFactory.decodeStream(it, null, bounds) } ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= maxDim || bounds.outHeight / (sample * 2) >= maxDim)
+            sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        return try {
+            open()?.use { BitmapFactory.decodeStream(it, null, opts) }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // map an absolute path inside the target app's dirs to the provider's document id
+    private fun docIdForPath(pkg: String, absPath: String): String? {
+        val map = listOf(
+            "/storage/emulated/0/Android/data/$pkg/" to "$pkg/android_data/",
+            "/storage/emulated/0/Android/obb/$pkg/" to "$pkg/android_obb/",
+            "/data/data/$pkg/" to "$pkg/data/",
+            "/data/user/0/$pkg/" to "$pkg/data/"
+        )
+        for ((prefix, docPrefix) in map)
+            if (absPath.startsWith(prefix)) return docPrefix + absPath.removePrefix(prefix)
+        return null
+    }
+
+    fun loadIcon(ctx: Context, tree: Uri, pkg: String, iconPath: String): Bitmap? {
+        if (iconPath.isBlank()) return null
+        val f = File(iconPath)
+        if (f.canRead()) return decodeScaled(512) { f.inputStream() }
+        // Android/data of another app isn't directly readable — go through the SAF grant
+        val docId = docIdForPath(pkg, iconPath) ?: return null
+        return try {
+            val uri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+            decodeScaled(512) { ctx.contentResolver.openInputStream(uri) }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun loadPickedImage(ctx: Context, uri: Uri): Bitmap? =
+        decodeScaled(1024) { ctx.contentResolver.openInputStream(uri) }
+
+    // the target app reads art straight off disk, so the new PNG must live somewhere
+    // both apps can reach by absolute path — a public Pictures subfolder
+    private fun writeArtPng(ctx: Context, bmp: Bitmap, gameName: String): Result<String> {
+        val safe = gameName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(40).ifBlank { "game" }
+        val fileName = "$safe-${System.currentTimeMillis()}.png"
+        return try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val resolver = ctx.contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/GamePathFixer")
+                }
+                val uri = resolver.insert(
+                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                    values
+                ) ?: return Result.failure(Exception("Couldn't create the art file"))
+                resolver.openOutputStream(uri)?.use {
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+                } ?: return Result.failure(Exception("Couldn't write the art file"))
+                val path = resolver.query(
+                    uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null
+                )?.use { if (it.moveToFirst()) it.getString(0) else null }
+                    ?: return Result.failure(Exception("Couldn't resolve the art file path"))
+                Result.success(path)
+            } else {
+                val dir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                    "GamePathFixer"
+                )
+                dir.mkdirs()
+                val f = File(dir, fileName)
+                f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                Result.success(f.absolutePath)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun saveChanges(
+        ctx: Context,
+        tree: Uri,
+        game: GameRow,
+        newPathRaw: String?,
+        newNameRaw: String?,
+        artUri: Uri?
+    ): Result<String> {
+        val newPath = newPathRaw?.trim()?.takeIf { it.isNotEmpty() && it != game.path }
+        val newName = newNameRaw?.trim()?.takeIf { it.isNotEmpty() && it != game.name }
+        if (newPath == null && newName == null && artUri == null)
+            return Result.failure(Exception("Nothing changed"))
+
+        if (newPath != null) {
+            if (!newPath.startsWith("/"))
+                return Result.failure(Exception("New path must be absolute (start with /)"))
+            if (canCheckFiles() && !File(newPath).exists())
+                return Result.failure(Exception("That file doesn't exist:\n$newPath"))
+        }
+
+        var artPath: String? = null
+        if (artUri != null) {
+            val bmp = loadPickedImage(ctx, artUri)
+                ?: return Result.failure(Exception("Couldn't read the picked image"))
+            artPath = writeArtPng(ctx, bmp, newName ?: game.name)
+                .getOrElse { return Result.failure(it) }
+        }
 
         val pulled = pullDb(ctx, tree)
             ?: return Result.failure(Exception("Couldn't read ux_db — re-grant folder access"))
@@ -219,13 +347,22 @@ object Repo {
         try {
             val db = SQLiteDatabase.openDatabase(local.path, null, SQLiteDatabase.OPEN_READWRITE)
             val idArg = arrayOf(game.id.toString())
-            db.execSQL("UPDATE t_game_library SET package_name=? WHERE id=?",
-                arrayOf(newPath, game.id.toString()))
+            if (newPath != null)
+                db.execSQL("UPDATE t_game_library SET package_name=? WHERE id=?",
+                    arrayOf(newPath, game.id.toString()))
             db.rawQuery("SELECT data FROM t_game_library WHERE id=?", idArg).use { c ->
                 if (c.moveToFirst()) {
                     var data = c.getString(0) ?: ""
-                    if (game.path.isNotBlank()) data = data.replace(game.path, newPath)
-                    if (game.jsonPath.isNotBlank()) data = data.replace(game.jsonPath, newPath)
+                    if (newPath != null) {
+                        if (game.path.isNotBlank()) data = data.replace(game.path, newPath)
+                        if (game.jsonPath.isNotBlank()) data = data.replace(game.jsonPath, newPath)
+                    }
+                    if (newName != null || artPath != null) {
+                        val j = JSONObject(data)
+                        newName?.let { j.put("name", it) }
+                        artPath?.let { j.put("localGameIconPath", it) }
+                        data = j.toString()
+                    }
                     db.execSQL("UPDATE t_game_library SET data=? WHERE id=?",
                         arrayOf(data, game.id.toString()))
                 }
@@ -246,19 +383,24 @@ object Repo {
         } catch (e: Exception) {
             return Result.failure(e)
         }
-        // a stale WAL would replay the old path right over our edit on next launch
+        // a stale WAL would replay the old values right over our edit on next launch
         dir.findFile("ux_db-wal")?.delete()
         dir.findFile("ux_db-shm")?.delete()
 
         val ok = try {
             ctx.contentResolver.openInputStream(dbDoc.uri)?.use {
-                it.readBytes().toString(Charsets.ISO_8859_1).contains(newPath)
+                val bytes = it.readBytes().toString(Charsets.ISO_8859_1)
+                (newPath == null || bytes.contains(newPath)) &&
+                    (artPath == null || bytes.contains(artPath))
             } ?: false
         } catch (e: Exception) {
             false
         }
-        return if (ok) Result.success("Saved — new path is in the game library")
-        else Result.failure(Exception("Wrote the DB but couldn't verify the new path — check in the app"))
+        val what = listOfNotNull(
+            newPath?.let { "path" }, newName?.let { "name" }, artPath?.let { "art" }
+        ).joinToString(" + ")
+        return if (ok) Result.success("Saved $what to the game library")
+        else Result.failure(Exception("Wrote the DB but couldn't verify the change — check in the app"))
     }
 }
 
@@ -298,6 +440,10 @@ fun AppRoot() {
     var games by remember { mutableStateOf<List<GameRow>>(emptyList()) }
     var editing by remember { mutableStateOf<GameRow?>(null) }
     var newPath by remember { mutableStateOf("") }
+    var newName by remember { mutableStateOf("") }
+    var artUri by remember { mutableStateOf<Uri?>(null) }
+    var artPreview by remember { mutableStateOf<Bitmap?>(null) }
+    var currentArt by remember { mutableStateOf<Bitmap?>(null) }
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     var hasRoot by remember { mutableStateOf(false) }
@@ -356,6 +502,25 @@ fun AppRoot() {
         else toast("Couldn't turn that pick into a real path — type it manually")
     }
 
+    val artLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) artUri = uri
+    }
+
+    LaunchedEffect(artUri) {
+        artPreview = artUri?.let { withContext(Dispatchers.IO) { Repo.loadPickedImage(ctx, it) } }
+    }
+
+    LaunchedEffect(editing, treeUri) {
+        val g = editing
+        val t = treeUri
+        val v = selected
+        currentArt =
+            if (g == null || t == null || v == null) null
+            else withContext(Dispatchers.IO) { Repo.loadIcon(ctx, t, v.pkg, g.iconPath) }
+    }
+
     val editingGame = editing
     val sel = selected
 
@@ -373,7 +538,8 @@ fun AppRoot() {
                 )
             }) { pad ->
                 Column(
-                    Modifier.padding(pad).padding(16.dp).fillMaxSize(),
+                    Modifier.padding(pad).padding(16.dp).fillMaxSize()
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text("Current path", style = MaterialTheme.typography.labelLarge)
@@ -396,33 +562,79 @@ fun AppRoot() {
                         textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         minLines = 2
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { exeLauncher.launch(arrayOf("*/*")) }) {
-                            Text("Browse…")
+                    OutlinedButton(onClick = { exeLauncher.launch(arrayOf("*/*")) }) {
+                        Text("Browse…")
+                    }
+
+                    Spacer(Modifier.height(4.dp))
+                    Text("Display name", style = MaterialTheme.typography.labelLarge)
+                    OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    Spacer(Modifier.height(4.dp))
+                    Text("Game art", style = MaterialTheme.typography.labelLarge)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        currentArt?.let {
+                            Image(
+                                it.asImageBitmap(), "current art",
+                                Modifier.size(72.dp).clip(RoundedCornerShape(8.dp)),
+                                contentScale = ContentScale.Crop
+                            )
                         }
-                        Button(
-                            enabled = !busy && newPath.isNotBlank() && newPath != editingGame.path,
-                            onClick = {
-                                scope.launch {
-                                    busy = true
-                                    status = null
-                                    if (hasRoot) withContext(Dispatchers.IO) { Repo.suForceStop(sel.pkg) }
-                                    val res = withContext(Dispatchers.IO) {
-                                        Repo.saveFix(ctx, treeUri!!, editingGame, newPath)
-                                    }
-                                    busy = false
-                                    res.fold(
-                                        onSuccess = {
-                                            toast(it)
-                                            editing = null
-                                            reload()
-                                        },
-                                        onFailure = { status = it.message }
+                        artPreview?.let {
+                            Text("→", fontSize = 18.sp)
+                            Image(
+                                it.asImageBitmap(), "new art",
+                                Modifier.size(72.dp).clip(RoundedCornerShape(8.dp)),
+                                contentScale = ContentScale.Crop
+                            )
+                        }
+                        Column {
+                            OutlinedButton(onClick = { artLauncher.launch("image/*") }) {
+                                Text(if (artUri == null) "Choose image…" else "Change…")
+                            }
+                            if (artUri != null) TextButton(onClick = { artUri = null }) {
+                                Text("Keep current art")
+                            }
+                        }
+                    }
+
+                    val dirty = (newPath.isNotBlank() && newPath != editingGame.path) ||
+                        (newName.isNotBlank() && newName.trim() != editingGame.name) ||
+                        artUri != null
+                    Button(
+                        enabled = !busy && dirty,
+                        onClick = {
+                            scope.launch {
+                                busy = true
+                                status = null
+                                if (hasRoot) withContext(Dispatchers.IO) { Repo.suForceStop(sel.pkg) }
+                                val res = withContext(Dispatchers.IO) {
+                                    Repo.saveChanges(
+                                        ctx, treeUri!!, editingGame,
+                                        newPath, newName, artUri
                                     )
                                 }
+                                busy = false
+                                res.fold(
+                                    onSuccess = {
+                                        toast(it)
+                                        editing = null
+                                        artUri = null
+                                        reload()
+                                    },
+                                    onFailure = { status = it.message }
+                                )
                             }
-                        ) { Text(if (busy) "Saving…" else "Save") }
-                    }
+                        }
+                    ) { Text(if (busy) "Saving…" else "Save changes") }
 
                     Spacer(Modifier.height(8.dp))
                     if (hasRoot) {
@@ -505,7 +717,10 @@ fun AppRoot() {
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
                     ) {
                         items(games, key = { it.id }) { g ->
-                            Card(onClick = { editing = g; newPath = g.path; status = null }) {
+                            Card(onClick = {
+                                editing = g; newPath = g.path; newName = g.name
+                                artUri = null; status = null
+                            }) {
                                 Column(Modifier.fillMaxWidth().padding(12.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Text(
