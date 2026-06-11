@@ -269,6 +269,23 @@ object Repo {
         }
     }
 
+    // BitmapFactory chokes on some formats (HEIC/AVIF variants); ImageDecoder doesn't.
+    // Software allocator because Bitmap.compress can't read hardware bitmaps.
+    private fun decodeFileSmart(f: File, maxDim: Int): Bitmap? {
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                val src = android.graphics.ImageDecoder.createSource(f)
+                return android.graphics.ImageDecoder.decodeBitmap(src) { dec, info, _ ->
+                    val s = maxOf(info.size.width, info.size.height) / maxDim
+                    if (s > 1) dec.setTargetSampleSize(s)
+                    dec.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                }
+            } catch (e: Exception) {
+            }
+        }
+        return decodeScaled(maxDim) { f.inputStream() }
+    }
+
     // picker URI grants can go stale (and cloud-backed photos can fail on re-open),
     // so grab the bytes the moment the user picks
     fun cachePickedImage(ctx: Context, uri: Uri): Result<File> {
@@ -277,15 +294,23 @@ object Repo {
             ctx.contentResolver.openInputStream(uri)?.use { ins ->
                 f.outputStream().use { ins.copyTo(it) }
             } ?: return Result.failure(Exception("Couldn't open the picked image"))
-            if (decodeScaled(64) { f.inputStream() } == null)
-                Result.failure(Exception("That file isn't a readable image — try a different one"))
-            else Result.success(f)
+            val size = f.length()
+            if (size == 0L)
+                return Result.failure(Exception(
+                    "The picker returned an empty file — if it's a cloud photo, " +
+                        "download it to the device first"))
+            if (decodeFileSmart(f, 64) == null) {
+                val mime = ctx.contentResolver.getType(uri) ?: "unknown type"
+                return Result.failure(Exception(
+                    "Couldn't decode that image ($size bytes, $mime) — try a different one"))
+            }
+            Result.success(f)
         } catch (e: Exception) {
             Result.failure(Exception("Couldn't read the picked image (${e.message})"))
         }
     }
 
-    fun decodeArtFile(f: File): Bitmap? = decodeScaled(1024) { f.inputStream() }
+    fun decodeArtFile(f: File): Bitmap? = decodeFileSmart(f, 1024)
 
     // the target app reads art straight off disk, so the new PNG must live somewhere
     // both apps can reach by absolute path — a public Pictures subfolder
