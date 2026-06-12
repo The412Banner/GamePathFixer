@@ -86,11 +86,7 @@ data class GameRow(
     val path: String,
     val jsonPath: String,
     val iconPath: String,
-    val exists: Boolean?,
-    // GameHub 6.0 moved the library from ux_db to db_game_library.db (Room),
-    // splitting each game across t_game_library_base + t_game_launch_method
-    val v6: Boolean = false,
-    val launchMethodId: Long = -1
+    val exists: Boolean?
 )
 
 object Repo {
@@ -177,37 +173,23 @@ object Repo {
         }
     }
 
-    private fun pullDb(ctx: Context, tree: Uri, dbName: String): Pair<DocumentFile, File>? {
+    private fun pullDb(ctx: Context, tree: Uri): Pair<DocumentFile, File>? {
         val dir = dbDir(ctx, tree) ?: return null
         val work = workDir(ctx)
         work.deleteRecursively()
         work.mkdirs()
-        if (!copyOut(ctx, dir, dbName, work)) return null
+        if (!copyOut(ctx, dir, "ux_db", work)) return null
         // WAL can hold newer rows than the main file; copy it so SQLite replays it
-        copyOut(ctx, dir, "$dbName-wal", work)
-        copyOut(ctx, dir, "$dbName-shm", work)
-        return dir to File(work, dbName)
-    }
-
-    // 6.0 keeps the legacy ux_db around after migration, so check the new DB first
-    fun libraryDbName(ctx: Context, tree: Uri): String? {
-        val dir = dbDir(ctx, tree) ?: return null
-        if (dir.findFile("db_game_library.db") != null) return "db_game_library.db"
-        if (dir.findFile("ux_db") != null) return "ux_db"
-        return null
+        copyOut(ctx, dir, "ux_db-wal", work)
+        copyOut(ctx, dir, "ux_db-shm", work)
+        return dir to File(work, "ux_db")
     }
 
     fun loadGames(ctx: Context, tree: Uri): Result<List<GameRow>> {
-        val dbName = libraryDbName(ctx, tree)
+        val pulled = pullDb(ctx, tree)
             ?: return Result.failure(Exception(
-                "Couldn't find the game library database. Re-grant access and pick " +
-                    "the app's data root (the folder that contains 'databases')."))
-        return if (dbName == "ux_db") loadGamesV5(ctx, tree) else loadGamesV6(ctx, tree)
-    }
-
-    private fun loadGamesV5(ctx: Context, tree: Uri): Result<List<GameRow>> {
-        val pulled = pullDb(ctx, tree, "ux_db")
-            ?: return Result.failure(Exception("Couldn't read ux_db — re-grant folder access"))
+                "Couldn't read ux_db. Re-grant access and pick the app's data root " +
+                    "(the folder that contains 'databases')."))
         val (_, local) = pulled
         val canCheck = canCheckFiles()
         return try {
@@ -232,50 +214,6 @@ object Repo {
                     val exists =
                         if (canCheck && path.startsWith("/")) File(path).exists() else null
                     rows.add(GameRow(id, name, path, jsonPath, iconPath, exists))
-                }
-            }
-            db.close()
-            Result.success(rows)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    // only local exe games carry filePath; Steam/Epic rows are server-synced, skip them
-    private fun loadGamesV6(ctx: Context, tree: Uri): Result<List<GameRow>> {
-        val pulled = pullDb(ctx, tree, "db_game_library.db")
-            ?: return Result.failure(Exception(
-                "Couldn't read db_game_library.db — re-grant folder access"))
-        val (_, local) = pulled
-        val canCheck = canCheckFiles()
-        return try {
-            val db = SQLiteDatabase.openDatabase(local.path, null, SQLiteDatabase.OPEN_READWRITE)
-            val rows = mutableListOf<GameRow>()
-            db.rawQuery(
-                "SELECT _id, launch_method_id, game_name, cover_image, extension_data " +
-                    "FROM t_game_library_base", null
-            ).use { c ->
-                while (c.moveToNext()) {
-                    val ext = c.getString(4) ?: ""
-                    var path = ""
-                    var iconPath = ""
-                    try {
-                        val j = JSONObject(ext)
-                        path = j.optString("filePath")
-                        iconPath = j.optString("localGameIconPath")
-                    } catch (_: Exception) {
-                    }
-                    if (path.isBlank()) continue
-                    val cover = c.getString(3) ?: ""
-                    if (cover.startsWith("/")) iconPath = cover
-                    var name = c.getString(2) ?: ""
-                    if (name.isBlank()) name = path.substringAfterLast('/')
-                    val exists =
-                        if (canCheck && path.startsWith("/")) File(path).exists() else null
-                    rows.add(GameRow(
-                        c.getLong(0), name, path, path, iconPath, exists,
-                        v6 = true, launchMethodId = c.getLong(1)
-                    ))
                 }
             }
             db.close()
@@ -442,83 +380,31 @@ object Repo {
                 .getOrElse { return Result.failure(it) }
         }
 
-        val dbName = if (game.v6) "db_game_library.db" else "ux_db"
-        val pulled = pullDb(ctx, tree, dbName)
-            ?: return Result.failure(Exception("Couldn't read $dbName — re-grant folder access"))
+        val pulled = pullDb(ctx, tree)
+            ?: return Result.failure(Exception("Couldn't read ux_db — re-grant folder access"))
         val (dir, local) = pulled
 
         try {
             val db = SQLiteDatabase.openDatabase(local.path, null, SQLiteDatabase.OPEN_READWRITE)
             val idArg = arrayOf(game.id.toString())
-            if (game.v6) {
-                // 6.0: name/cover live in columns, path/icon in extension_data JSON…
-                db.rawQuery(
-                    "SELECT game_name, cover_image, extension_data " +
-                        "FROM t_game_library_base WHERE _id=?", idArg
-                ).use { c ->
-                    if (c.moveToFirst()) {
-                        val ext = JSONObject(c.getString(2) ?: "{}")
-                        newPath?.let { ext.put("filePath", it) }
-                        artPath?.let { ext.put("localGameIconPath", it) }
-                        db.execSQL(
-                            "UPDATE t_game_library_base SET game_name=?, cover_image=?, " +
-                                "extension_data=? WHERE _id=?",
-                            arrayOf(
-                                newName ?: c.getString(0),
-                                artPath ?: c.getString(1),
-                                ext.toString(),
-                                game.id.toString()
-                            )
-                        )
+            if (newPath != null)
+                db.execSQL("UPDATE t_game_library SET package_name=? WHERE id=?",
+                    arrayOf(newPath, game.id.toString()))
+            db.rawQuery("SELECT data FROM t_game_library WHERE id=?", idArg).use { c ->
+                if (c.moveToFirst()) {
+                    var data = c.getString(0) ?: ""
+                    if (newPath != null) {
+                        if (game.path.isNotBlank()) data = data.replace(game.path, newPath)
+                        if (game.jsonPath.isNotBlank()) data = data.replace(game.jsonPath, newPath)
                     }
-                }
-                // …and the linked launch-method row duplicates all three
-                if (game.launchMethodId >= 0) {
-                    val lmArg = arrayOf(game.launchMethodId.toString())
-                    db.rawQuery(
-                        "SELECT extension_data FROM t_game_launch_method WHERE id=?", lmArg
-                    ).use { c ->
-                        if (c.moveToFirst()) {
-                            try {
-                                val ext = JSONObject(c.getString(0) ?: "{}")
-                                newPath?.let { ext.put("exePath", it) }
-                                newName?.let { ext.put("name", it) }
-                                artPath?.let { ext.put("coverImage", it) }
-                                db.execSQL(
-                                    "UPDATE t_game_launch_method SET extension_data=? WHERE id=?",
-                                    arrayOf(ext.toString(), game.launchMethodId.toString())
-                                )
-                            } catch (_: Exception) {
-                            }
-                        }
+                    if (newName != null || artPath != null) {
+                        val j = JSONObject(data)
+                        newName?.let { j.put("name", it) }
+                        artPath?.let { j.put("localGameIconPath", it) }
+                        data = j.toString()
                     }
-                }
-            } else {
-                if (newPath != null)
-                    db.execSQL("UPDATE t_game_library SET package_name=? WHERE id=?",
-                        arrayOf(newPath, game.id.toString()))
-                db.rawQuery("SELECT data FROM t_game_library WHERE id=?", idArg).use { c ->
-                    if (c.moveToFirst()) {
-                        var data = c.getString(0) ?: ""
-                        if (newPath != null) {
-                            // the launcher serializes data with escaped slashes (\/), so
-                            // replace both forms or the JSON copy of the path survives
-                            fun esc(s: String) = s.replace("/", "\\/")
-                            for (old in listOf(game.path, game.jsonPath)) {
-                                if (old.isBlank()) continue
-                                data = data.replace(old, newPath)
-                                    .replace(esc(old), esc(newPath))
-                            }
-                        }
-                        if (newName != null || artPath != null) {
-                            val j = JSONObject(data)
-                            newName?.let { j.put("name", it) }
-                            artPath?.let { j.put("localGameIconPath", it) }
-                            data = j.toString()
-                        }
-                        db.execSQL("UPDATE t_game_library SET data=? WHERE id=?",
-                            arrayOf(data, game.id.toString()))
-                    }
+                    db.execSQL("UPDATE t_game_library SET data=? WHERE id=?",
+                        arrayOf(data, game.id.toString()))
                 }
             }
             // merge everything into the single main file before writing back
@@ -528,18 +414,18 @@ object Repo {
             return Result.failure(e)
         }
 
-        val dbDoc = dir.findFile(dbName)
-            ?: return Result.failure(Exception("$dbName vanished during write-back"))
+        val dbDoc = dir.findFile("ux_db")
+            ?: return Result.failure(Exception("ux_db vanished during write-back"))
         try {
             ctx.contentResolver.openOutputStream(dbDoc.uri, "wt")?.use { out ->
                 local.inputStream().use { it.copyTo(out) }
-            } ?: return Result.failure(Exception("Couldn't open $dbName for writing"))
+            } ?: return Result.failure(Exception("Couldn't open ux_db for writing"))
         } catch (e: Exception) {
             return Result.failure(e)
         }
         // a stale WAL would replay the old values right over our edit on next launch
-        dir.findFile("$dbName-wal")?.delete()
-        dir.findFile("$dbName-shm")?.delete()
+        dir.findFile("ux_db-wal")?.delete()
+        dir.findFile("ux_db-shm")?.delete()
 
         val ok = try {
             ctx.contentResolver.openInputStream(dbDoc.uri)?.use {
