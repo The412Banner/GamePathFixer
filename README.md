@@ -14,6 +14,22 @@ provider — and if you *are* rooted, the app uses root to make saves even safer
 
 ---
 
+## Compatibility — GameHub **v5.x** builds only
+
+This app works with **5.x-generation** GameHub-based builds — the ones that
+keep their game library in `databases/ux_db` (table `t_game_library`). That
+includes 5.1.x and 5.3.5-base builds under any package name.
+
+> ✅ **Verified & tested on GameHub Lite 5.1.7** — exe path fix, display name,
+> and game art changes all confirmed working end-to-end on a real device.
+
+❌ **GameHub 6.0+ builds are NOT supported.** 6.0 moved the game library to a
+completely different database (`db_game_library.db`) with a new multi-table
+schema. A 6.0 build may still appear in the variant picker (it ships the same
+data provider), but loading its library will fail. Don't use this app on 6.0+.
+
+---
+
 ## Why this exists
 
 GameHub-based launchers keep the game library in a private SQLite database
