@@ -16,14 +16,26 @@ provider — and if you *are* rooted, the app uses root to make saves even safer
 
 ## Why this exists
 
-GameHub-based launchers keep the game library in a private SQLite database
-(`/data/data/<pkg>/databases/ux_db`, table `t_game_library`). Each entry
-stores:
+GameHub-based launchers keep the game library in a private SQLite database,
+and every value this app edits is stored in **more than one place**:
+
+**5.x-generation builds** (`databases/ux_db`, table `t_game_library`):
 
 - the **exe path twice** — in the `package_name` column *and* in the
   `filePath` field of the row's `data` JSON blob,
 - the **display name** in the JSON `name` field,
 - the **card art** as a file path in the JSON `localGameIconPath` field.
+
+**6.0-generation builds** (`databases/db_game_library.db` — the library moved
+to a new schema; both generations are detected automatically):
+
+- the **exe path twice** — `filePath` in `t_game_library_base.extension_data`
+  *and* `exePath` in the linked `t_game_launch_method.extension_data`,
+- the **display name twice** — the `game_name` column *and* `name` in the
+  launch-method JSON,
+- the **card art three times** — the `cover_image` column,
+  `localGameIconPath` in the row JSON, and `coverImage` in the launch-method
+  JSON.
 
 If you move or rename a game folder, both stored paths go stale and the
 launcher breaks for that game (no PC Game Settings, no launch). There's no
